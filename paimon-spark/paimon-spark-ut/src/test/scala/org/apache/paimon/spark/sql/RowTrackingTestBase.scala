@@ -952,4 +952,47 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
       assert(!indexEntries.exists(entry => entry.partition().getString(0).toString.equals("p1")))
     }
   }
+
+  test("Data Evolution: merge into partitioned table with data-evolution partial update") {
+    withTable("s", "t") {
+      sql("CREATE TABLE s (id INT, b INT, dtm STRING)")
+      sql("INSERT INTO s VALUES (2, 22, '20260127'), (3, 33, '20260127')")
+
+      sql("""CREATE TABLE t (id INT, b INT, c INT, dtm STRING)
+            |PARTITIONED BY (dtm)
+            |TBLPROPERTIES ('row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')
+            |""".stripMargin)
+      sql(
+        "INSERT INTO t SELECT /*+ REPARTITION(1) */ id, id AS b, id AS c, '20260127' AS dtm FROM range(2, 5)")
+
+      sql("""
+            |MERGE INTO t
+            |USING s
+            |ON t.id = s.id AND t.dtm = s.dtm
+            |WHEN MATCHED THEN UPDATE SET t.b = s.b
+            |WHEN NOT MATCHED THEN INSERT (id, b, c, dtm) VALUES (id, b, 11, dtm)
+            |""".stripMargin)
+
+      // Verify count
+      checkAnswer(sql("SELECT count(*) FROM t"), Seq(Row(3)))
+
+      // Verify reading all columns works
+      checkAnswer(
+        sql("SELECT id, b, c, dtm FROM t ORDER BY id"),
+        Seq(Row(2, 22, 2, "20260127"), Row(3, 33, 3, "20260127"), Row(4, 4, 4, "20260127"))
+      )
+
+      // Verify reading single non-partition column works (this was the bug scenario)
+      checkAnswer(
+        sql("SELECT b FROM t WHERE dtm = '20260127' ORDER BY b"),
+        Seq(Row(4), Row(22), Row(33))
+      )
+
+      // Verify reading only partition column works
+      checkAnswer(
+        sql("SELECT DISTINCT dtm FROM t"),
+        Seq(Row("20260127"))
+      )
+    }
+  }
 }

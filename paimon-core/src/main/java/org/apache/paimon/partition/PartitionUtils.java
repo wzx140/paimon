@@ -40,10 +40,21 @@ public class PartitionUtils {
         if (dataSchema.partitionKeys().isEmpty()) {
             return Pair.of(null, dataFields);
         }
+        // Filter partition keys to only include those present in schema fields.
+        // This handles data-evolution partial update where writeCols may not include partition
+        // keys.
+        List<String> schemaFieldNames = dataSchema.fieldNames();
+        List<String> existingPartitionKeys =
+                dataSchema.partitionKeys().stream()
+                        .filter(schemaFieldNames::contains)
+                        .collect(Collectors.toList());
+        if (existingPartitionKeys.isEmpty()) {
+            return Pair.of(null, dataFields);
+        }
         return getPartitionMapping2fieldsWithoutPartition(
-                dataSchema.partitionKeys(),
+                existingPartitionKeys,
                 dataFields,
-                dataSchema.projectedLogicalRowType(dataSchema.partitionKeys()));
+                dataSchema.projectedLogicalRowType(existingPartitionKeys));
     }
 
     public static Pair<int[], RowType> getPartitionMapping(
