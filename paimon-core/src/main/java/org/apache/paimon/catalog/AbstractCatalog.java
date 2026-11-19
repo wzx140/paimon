@@ -29,6 +29,7 @@ import org.apache.paimon.fs.cache.CachingFileIO;
 import org.apache.paimon.fs.cache.LocalCacheManager;
 import org.apache.paimon.function.Function;
 import org.apache.paimon.function.FunctionChange;
+import org.apache.paimon.operation.EntropyInjectTemplateFilesDeletion;
 import org.apache.paimon.operation.Lock;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.partition.Partition;
@@ -38,6 +39,7 @@ import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.SchemaValidation;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.FormatTable;
@@ -71,6 +73,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.CoreOptions.DATA_FILE_EXTERNAL_PATHS;
+import static org.apache.paimon.CoreOptions.DATA_FILE_EXTERNAL_PATHS_STRATEGY;
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_EXTERNAL_PATH;
 import static org.apache.paimon.CoreOptions.PATH;
 import static org.apache.paimon.CoreOptions.TYPE;
@@ -385,6 +388,8 @@ public abstract class AbstractCatalog implements Catalog {
         }
 
         Set<Path> externalPaths = new HashSet<>();
+        List<EntropyInjectTemplateFilesDeletion> templateDeletions = new ArrayList<>();
+        List<Path> retainedBranchFiles = Collections.emptyList();
         Path tablePath = getTableLocation(identifier);
         if (tableExistsInFileSystem(tablePath, DEFAULT_MAIN_BRANCH)) {
             TableType tableType = CoreOptions.fromMap(loadTableSchema(identifier).options()).type();
@@ -392,15 +397,37 @@ public abstract class AbstractCatalog implements Catalog {
                 // Cleanup only needs persisted metadata, even if runtime options are invalid.
                 FileIO tableFileIO = fileIO(tablePath);
                 SchemaManager schemaManager = new FileSystemSchemaManager(tableFileIO, tablePath);
-                externalPaths.addAll(getSchemaExternalPaths(schemaManager.listAll()));
+                boolean deletesData = !loadTableMetadata(identifier).isExternal();
+                List<TableSchema> mainSchemas = schemaManager.listAll();
+                externalPaths.addAll(getSchemaExternalPaths(mainSchemas));
+                if (deletesData) {
+                    EntropyInjectTemplateFilesDeletion.collectIfTemplate(
+                                    tableFileIO, tablePath, DEFAULT_MAIN_BRANCH, mainSchemas)
+                            .ifPresent(templateDeletions::add);
+                }
                 for (String branch : FileSystemBranchManager.branches(tableFileIO, tablePath)) {
-                    externalPaths.addAll(
-                            getSchemaExternalPaths(schemaManager.copyWithBranch(branch).listAll()));
+                    List<TableSchema> branchSchemas =
+                            schemaManager.copyWithBranch(branch).listAll();
+                    externalPaths.addAll(getSchemaExternalPaths(branchSchemas));
+                    if (deletesData) {
+                        EntropyInjectTemplateFilesDeletion.collectIfTemplate(
+                                        tableFileIO, tablePath, branch, branchSchemas)
+                                .ifPresent(templateDeletions::add);
+                    }
+                }
+                if (deletesData) {
+                    retainedBranchFiles =
+                            EntropyInjectTemplateFilesDeletion.retainedBranchFiles(
+                                    tableFileIO, tablePath);
                 }
             }
         }
 
         dropTableImpl(identifier, new ArrayList<>(externalPaths));
+        templateDeletions.forEach(EntropyInjectTemplateFilesDeletion::deleteCollectedFiles);
+        if (!retainedBranchFiles.isEmpty()) {
+            fileIO(tablePath).deleteFilesQuietly(retainedBranchFiles);
+        }
     }
 
     protected boolean tableExists(Identifier identifier) {
@@ -417,7 +444,9 @@ public abstract class AbstractCatalog implements Catalog {
                             Map<String, String> options = schema.toSchema().options();
                             return Arrays.stream(
                                     new String[] {
-                                        options.get(DATA_FILE_EXTERNAL_PATHS.key()),
+                                        EntropyInjectTemplateFilesDeletion.isTemplate(schema)
+                                                ? null
+                                                : options.get(DATA_FILE_EXTERNAL_PATHS.key()),
                                         options.get(GLOBAL_INDEX_EXTERNAL_PATH.key())
                                     });
                         })
@@ -560,6 +589,9 @@ public abstract class AbstractCatalog implements Catalog {
                             + "). Drop and re-create the table instead.");
         }
 
+        String strategy = DATA_FILE_EXTERNAL_PATHS_STRATEGY.key();
+        SchemaValidation.validateExternalPathStrategyChange(
+                existing.options().get(strategy), newSchema.options().get(strategy));
         replaceTableImpl(identifier, (FileStoreTable) existing, newSchema);
     }
 

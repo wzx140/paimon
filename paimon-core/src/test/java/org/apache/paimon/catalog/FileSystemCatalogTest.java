@@ -49,6 +49,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -287,6 +288,92 @@ public class FileSystemCatalogTest extends CatalogTestBase {
                 .containsEntry("fields.seq.sequence-group", "v");
         assertThatThrownBy(() -> ((FileStoreTable) catalog.getTable(identifier)).newScan())
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void testDropTableWithTemplateBranch() throws Exception {
+        catalog.createDatabase("template_db", false);
+        Identifier identifier = Identifier.create("template_db", "dropped");
+        java.nio.file.Path sharedRoot = tempFile.resolve("shared-data");
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .option(CoreOptions.BUCKET.key(), "-1")
+                        .option(
+                                CoreOptions.DATA_FILE_EXTERNAL_PATHS.key(),
+                                sharedRoot.toUri() + "/{hash}/dropped")
+                        .option(
+                                CoreOptions.DATA_FILE_EXTERNAL_PATHS_STRATEGY.key(),
+                                "entropy-inject-template")
+                        .build(),
+                false);
+        ((FileStoreTable) catalog.getTable(identifier)).createBranch("dev");
+        Identifier branchIdentifier = new Identifier("template_db", "dropped", "dev");
+        for (Identifier id : Arrays.asList(identifier, branchIdentifier)) {
+            FileStoreTable table = (FileStoreTable) catalog.getTable(id);
+            BatchWriteBuilder builder = table.newBatchWriteBuilder();
+            try (BatchTableWrite write = builder.newWrite();
+                    BatchTableCommit commit = builder.newCommit()) {
+                write.write(GenericRow.of(1));
+                commit.commit(write.prepareCommit());
+            }
+        }
+        try (Stream<java.nio.file.Path> files = Files.walk(sharedRoot)) {
+            assertThat(files.filter(Files::isRegularFile).count()).isEqualTo(2);
+        }
+
+        catalog.dropTable(identifier, false);
+
+        try (Stream<java.nio.file.Path> files = Files.walk(sharedRoot)) {
+            assertThat(files.filter(Files::isRegularFile).count()).isZero();
+        }
+    }
+
+    @Test
+    public void testDropTableWithMissingChainBranch() throws Exception {
+        catalog.createDatabase("chain_db", false);
+        Identifier identifier = Identifier.create("chain_db", "chained");
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .column("k", DataTypes.BIGINT())
+                        .column("seq", DataTypes.BIGINT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .primaryKey("dt", "k")
+                        .option(CoreOptions.BUCKET.key(), "1")
+                        .option(CoreOptions.BUCKET_KEY.key(), "k")
+                        .option(CoreOptions.SEQUENCE_FIELD.key(), "seq")
+                        .option(CoreOptions.CHAIN_TABLE_ENABLED.key(), "true")
+                        .option(CoreOptions.PARTITION_TIMESTAMP_PATTERN.key(), "$dt")
+                        .option(CoreOptions.PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd")
+                        .option(CoreOptions.CHAIN_TABLE_CHAIN_PARTITION_KEYS.key(), "dt")
+                        .build(),
+                false);
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        table.createBranch("snapshot");
+        table.createBranch("delta");
+        Path tablePath =
+                ((FileSystemCatalog) DelegateCatalog.rootCatalog(catalog))
+                        .getTableLocation(identifier);
+        for (String branch : Arrays.asList(Identifier.DEFAULT_MAIN_BRANCH, "snapshot", "delta")) {
+            new FileSystemSchemaManager(fileIO, tablePath, branch)
+                    .commitChanges(
+                            SchemaChange.setOption(
+                                    CoreOptions.SCAN_FALLBACK_SNAPSHOT_BRANCH.key(), "snapshot"),
+                            SchemaChange.setOption(
+                                    CoreOptions.SCAN_FALLBACK_DELTA_BRANCH.key(), "delta"));
+        }
+        // the chain loads while both branches are there
+        assertThat(catalog.getTable(identifier)).isNotNull();
+
+        table.branchManager().dropBranch("snapshot");
+
+        catalog.dropTable(identifier, false);
+
+        assertThatThrownBy(() -> catalog.getTable(identifier))
+                .isInstanceOf(Catalog.TableNotExistException.class);
     }
 
     @ParameterizedTest
