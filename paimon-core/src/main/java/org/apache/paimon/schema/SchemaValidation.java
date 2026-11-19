@@ -32,6 +32,7 @@ import org.apache.paimon.fileindex.FileIndexerFactory;
 import org.apache.paimon.fileindex.FileIndexerFactoryUtils;
 import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.format.csv.CsvOptions;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.TemplateEntropyInjectExternalPathProvider;
 import org.apache.paimon.iceberg.IcebergOptions;
 import org.apache.paimon.mergetree.compact.PartialUpdateMergeFunction;
@@ -473,7 +474,9 @@ public class SchemaValidation {
 
         for (String externalPath : paths) {
             boolean isTemplate = TemplateEntropyInjectExternalPathProvider.isTemplate(externalPath);
-            if (templateStrategy && !isTemplate) {
+            if (templateStrategy
+                    && !TemplateEntropyInjectExternalPathProvider.isTemplate(
+                            new Path(externalPath.trim()).toUri().getPath())) {
                 throw new IllegalArgumentException(
                         String.format(
                                 "External path '%s' must contain the '%s' placeholder when '%s' is '%s'.",
