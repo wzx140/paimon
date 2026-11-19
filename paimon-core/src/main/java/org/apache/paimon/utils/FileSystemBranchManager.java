@@ -25,6 +25,8 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.manifest.FileEntry;
 import org.apache.paimon.manifest.FileKind;
 import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.operation.EntropyInjectTemplateFilesDeletion;
+import org.apache.paimon.operation.TemplateFileDeletionPlan;
 import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
@@ -38,6 +40,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -145,6 +148,14 @@ public class FileSystemBranchManager implements BranchManager {
         checkArgument(
                 !BranchManager.isMainBranch(branchName), "The main branch cannot be deleted.");
         checkArgument(branchExists(branchName), "Branch name '%s' doesn't exist.", branchName);
+        Optional<TableSchema> schema = schemaManager.copyWithBranch(branchName).latest();
+        if (schema.isPresent() && EntropyInjectTemplateFilesDeletion.isTemplate(schema.get())) {
+            TemplateFileDeletionPlan plan =
+                    TemplateFileDeletionPlan.prepareBranch(fileIO, tablePath);
+            EntropyInjectTemplateFilesDeletion.collect(
+                    fileIO, tablePath, branchName, schema.get(), plan);
+            plan.seal();
+        }
         try {
             // Delete branch directory
             fileIO.delete(branchPath(branchName), true);
