@@ -30,6 +30,7 @@ import org.apache.paimon.fs.cache.LocalCacheManager;
 import org.apache.paimon.function.Function;
 import org.apache.paimon.function.FunctionChange;
 import org.apache.paimon.operation.Lock;
+import org.apache.paimon.operation.TemplateFileDeletionPlan;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.partition.Partition;
 import org.apache.paimon.partition.PartitionStatistics;
@@ -38,6 +39,7 @@ import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.SchemaValidation;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.FormatTable;
@@ -71,6 +73,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.CoreOptions.DATA_FILE_EXTERNAL_PATHS;
+import static org.apache.paimon.CoreOptions.DATA_FILE_EXTERNAL_PATHS_STRATEGY;
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_EXTERNAL_PATH;
 import static org.apache.paimon.CoreOptions.PATH;
 import static org.apache.paimon.CoreOptions.TYPE;
@@ -387,15 +390,25 @@ public abstract class AbstractCatalog implements Catalog {
         Set<Path> externalPaths = new HashSet<>();
         Path tablePath = getTableLocation(identifier);
         if (tableExistsInFileSystem(tablePath, DEFAULT_MAIN_BRANCH)) {
-            TableType tableType = CoreOptions.fromMap(loadTableSchema(identifier).options()).type();
-            if (tableType == TableType.TABLE || tableType == TableType.MATERIALIZED_TABLE) {
-                // Cleanup only needs persisted metadata, even if runtime options are invalid.
+            CoreOptions options = CoreOptions.fromMap(loadTableSchema(identifier).options());
+            if (options.type() == TableType.TABLE
+                    || options.type() == TableType.MATERIALIZED_TABLE) {
                 FileIO tableFileIO = fileIO(tablePath);
                 SchemaManager schemaManager = new FileSystemSchemaManager(tableFileIO, tablePath);
-                externalPaths.addAll(getSchemaExternalPaths(schemaManager.listAll()));
-                for (String branch : FileSystemBranchManager.branches(tableFileIO, tablePath)) {
-                    externalPaths.addAll(
-                            getSchemaExternalPaths(schemaManager.copyWithBranch(branch).listAll()));
+                boolean isExternal = loadTableMetadata(identifier).isExternal();
+                List<String> branches = new ArrayList<>();
+                branches.add(DEFAULT_MAIN_BRANCH);
+                branches.addAll(FileSystemBranchManager.branches(tableFileIO, tablePath));
+                for (String branch : branches) {
+                    SchemaManager branchSchema = schemaManager.copyWithBranch(branch);
+                    externalPaths.addAll(getSchemaExternalPaths(branchSchema.listAll()));
+                    Optional<TableSchema> latest = branchSchema.latest();
+                    if (!isExternal
+                            && latest.isPresent()
+                            && TemplateFileDeletionPlan.isTemplate(latest.get())) {
+                        TemplateFileDeletionPlan.save(
+                                tableFileIO, tablePath, branch, latest.get(), false);
+                    }
                 }
             }
         }
@@ -417,7 +430,9 @@ public abstract class AbstractCatalog implements Catalog {
                             Map<String, String> options = schema.toSchema().options();
                             return Arrays.stream(
                                     new String[] {
-                                        options.get(DATA_FILE_EXTERNAL_PATHS.key()),
+                                        TemplateFileDeletionPlan.isTemplate(schema)
+                                                ? null
+                                                : options.get(DATA_FILE_EXTERNAL_PATHS.key()),
                                         options.get(GLOBAL_INDEX_EXTERNAL_PATH.key())
                                     });
                         })
@@ -450,6 +465,8 @@ public abstract class AbstractCatalog implements Catalog {
         } catch (TableNotExistException ignored) {
         }
 
+        Path tablePath = getTableLocation(identifier);
+        TemplateFileDeletionPlan.checkCanCreateTable(fileIO(tablePath), tablePath);
         copyTableDefaultOptions(schema.options());
         validateCreateTable(schema, false);
 
@@ -560,6 +577,9 @@ public abstract class AbstractCatalog implements Catalog {
                             + "). Drop and re-create the table instead.");
         }
 
+        String strategy = DATA_FILE_EXTERNAL_PATHS_STRATEGY.key();
+        SchemaValidation.validateExternalPathStrategyChange(
+                existing.options().get(strategy), newSchema.options().get(strategy));
         replaceTableImpl(identifier, (FileStoreTable) existing, newSchema);
     }
 
